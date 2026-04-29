@@ -6,42 +6,41 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import dotenv from 'dotenv'
-import { createGitHubConnector } from './connectors/github'
-import { IConnector, RawItem, SyncState, PlatformSyncState } from './types'
+import { createGitHubConnector } from './connectors/github/index.js'
+import { createChromeConnector } from './connectors/chrome/index.js'
+import { LLMWikiCompiler } from './llm-wiki.js'
 
 // 每次啟動時強制重新加載 .env，確保獲取最新的值
 dotenv.config({ override: true })
 
-interface MCPServerConfig {
-  vaultPath: string
-  connectors: {
-    github?: string
-    youtube?: string
-    twitter?: string
-  }
-}
-
 export class SecondBrainMCPServer {
-  private config: MCPServerConfig
-  private connectors: Map<string, IConnector> = new Map()
-
-  constructor(config: MCPServerConfig) {
+  constructor(config) {
     this.config = config
+    this.connectors = new Map()
     this.initializeConnectors()
   }
 
-  private getSyncStatePath(platform: string): string {
+  getSyncStatePath(platform) {
     return path.join(this.config.vaultPath, 'raw', platform, '.sync-state.json')
   }
 
-  private initializeConnectors(): void {
-    // GitHub Connector (REST API)
+  initializeConnectors() {
+    // GitHub Connector (OAuth via gh CLI，預設)
     try {
-      const connector = createGitHubConnector()
+      const connector = createGitHubConnector(this.config.vaultPath)
       this.connectors.set('github', connector)
-      console.log('✓ GitHub Connector 初始化成功 (REST API)')
+      console.log('✓ GitHub Connector 初始化成功 (OAuth)')
     } catch (error) {
       console.error('✗ GitHub Connector 初始化失敗:', error)
+    }
+
+    // Chrome 書籤 Connector
+    try {
+      const connector = createChromeConnector()
+      this.connectors.set('chrome', connector)
+      console.log('✓ Chrome Connector 初始化成功')
+    } catch (error) {
+      console.error('✗ Chrome Connector 初始化失敗:', error)
     }
 
     // TODO: 其他 Connectors (YouTube, Twitter, etc.)
@@ -50,7 +49,7 @@ export class SecondBrainMCPServer {
   /**
    * 同步所有已初始化的 Connectors
    */
-  async syncAll(): Promise<void> {
+  async syncAll() {
     console.log('\n🔄 開始同步...\n')
 
     for (const [platform, connector] of this.connectors) {
@@ -69,11 +68,7 @@ export class SecondBrainMCPServer {
   /**
    * 同步單個平台
    */
-  private async syncPlatform(
-    platform: string,
-    connector: IConnector,
-    syncState: PlatformSyncState
-  ): Promise<void> {
+  async syncPlatform(platform, connector, syncState) {
     console.log(`📥 同步 ${platform}...`)
 
     // 取得上次同步時間
@@ -81,31 +76,33 @@ export class SecondBrainMCPServer {
       ? new Date(syncState.last_sync)
       : null
 
-    // 從 Connector 拉取資料
-    const items = await connector.fetchSince(lastSync)
-    console.log(`   找到 ${items.length} 筆新資料`)
-
-    if (items.length === 0) {
-      console.log(`   沒有新資料`)
-      return
-    }
-
     // 存進 vault/raw/{platform}/
     const rawDir = path.join(this.config.vaultPath, 'raw', platform)
     this.ensureDir(rawDir)
 
-    for (const item of items) {
-      const filePath = path.join(rawDir, `${item.id}.md`)
+    let savedCount = 0
 
+    // 每抓到一筆就立刻存檔（支援中途中斷後重跑）
+    const saveItem = async (item) => {
       if (await connector.isDuplicate(item, this.config.vaultPath)) {
-        console.log(`   跳過已存在: ${item.title}`)
-        continue
+        return
       }
-
+      const filePath = path.join(rawDir, `${item.id}.md`)
       const markdown = connector.toMarkdown(item)
       fs.writeFileSync(filePath, markdown, 'utf-8')
-      console.log(`   ✓ 存儲: ${item.title}`)
+      savedCount++
     }
+
+    if (connector.supportsStreaming) {
+      // 抓一個、存一個
+      await connector.fetchSince(lastSync, saveItem)
+    } else {
+      // 一般模式（GitHub 等小量資料）
+      const items = await connector.fetchSince(lastSync)
+      for (const item of items) await saveItem(item)
+    }
+
+    console.log(`   共存入 ${savedCount} 筆`)
 
     // 更新同步狀態
     syncState.last_sync = new Date().toISOString()
@@ -115,35 +112,31 @@ export class SecondBrainMCPServer {
    * 從 raw/ 編譯 wiki/
    * (TODO: 調用 LLM Wiki 和 Ingest Agent)
    */
-  async ingestRawToWiki(): Promise<void> {
+  async ingestRawToWiki() {
     console.log('\n📚 開始知識沉澱...\n')
 
-    const rawDir = path.join(this.config.vaultPath, 'raw')
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.log('⚠️  未設置 ANTHROPIC_API_KEY，跳過知識沉澱')
+      return
+    }
 
+    const rawDir = path.join(this.config.vaultPath, 'raw')
     if (!fs.existsSync(rawDir)) {
       console.log('✗ raw/ 資料夾不存在')
       return
     }
 
-    // 掃描 raw/ 底下的所有 .md 檔案
+    const compiler = new LLMWikiCompiler(this.config.vaultPath)
     const platformDirs = fs.readdirSync(rawDir)
 
     for (const platform of platformDirs) {
       const platformDir = path.join(rawDir, platform)
-      const stat = fs.statSync(platformDir)
+      if (!fs.statSync(platformDir).isDirectory()) continue
 
-      if (!stat.isDirectory()) continue
+      const files = fs.readdirSync(platformDir).filter(f => f.endsWith('.md') && !f.startsWith('.'))
+      console.log(`📂 處理 ${platform}（共 ${files.length} 筆）...`)
 
-      console.log(`📂 處理 ${platform} 的資料...`)
-
-      const files = fs.readdirSync(platformDir).filter((f) => f.endsWith('.md'))
-      console.log(`   共 ${files.length} 筆資料待沉澱`)
-
-      // TODO: 實作 LLM Wiki 編譯邏輯
-      // - 解析 frontmatter
-      // - 提取概念和實體
-      // - 建立 wiki/ 頁面
-      // - 更新 wiki/index.md
+      await compiler.compileAll(platform)
     }
 
     console.log('\n✓ 知識沉澱完成！')
@@ -152,7 +145,7 @@ export class SecondBrainMCPServer {
   /**
    * 載入同步狀態
    */
-  private loadSyncState(platform: string): PlatformSyncState {
+  loadSyncState(platform) {
     const statePath = this.getSyncStatePath(platform)
     if (fs.existsSync(statePath)) {
       const content = fs.readFileSync(statePath, 'utf-8')
@@ -164,7 +157,7 @@ export class SecondBrainMCPServer {
   /**
    * 儲存同步狀態
    */
-  private saveSyncState(platform: string, state: PlatformSyncState): void {
+  saveSyncState(platform, state) {
     const statePath = this.getSyncStatePath(platform)
     this.ensureDir(path.dirname(statePath))
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf-8')
@@ -173,7 +166,7 @@ export class SecondBrainMCPServer {
   /**
    * 確保目錄存在
    */
-  private ensureDir(dir: string): void {
+  ensureDir(dir) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true })
     }
@@ -182,7 +175,7 @@ export class SecondBrainMCPServer {
   /**
    * 取得連線狀態
    */
-  async checkConnections(): Promise<void> {
+  async checkConnections() {
     console.log('\n🔗 檢查連線...\n')
 
     for (const [name, connector] of this.connectors) {
@@ -200,11 +193,11 @@ export class SecondBrainMCPServer {
   /**
    * 清理資源
    */
-  async cleanup(): Promise<void> {
+  async cleanup() {
     for (const [name, connector] of this.connectors) {
       try {
-        if ('close' in connector && typeof (connector as any).close === 'function') {
-          await (connector as any).close()
+        if ('close' in connector && typeof connector.close === 'function') {
+          await connector.close()
         }
       } catch (error) {
         console.error(`清理 ${name} 資源時出錯:`, error)

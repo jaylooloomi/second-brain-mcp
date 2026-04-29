@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm install *)"
+      "Bash(npm install *)",
+      "WebSearch",
+      "Bash(pandoc \"C:\\\\Users\\\\User\\\\Downloads\\\\second-brain-plan.docx\" -o - --to markdown)",
+      "Bash(winget list *)",
+      "Bash(where pandoc *)"
     ]
   }
 }
